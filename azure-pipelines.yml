@@ -1,0 +1,376 @@
+trigger:
+  - develop
+  # - staging
+  # - hot-fix
+  # - release
+  # - main
+
+resources:
+- repo: self
+
+parameters:
+  - name: Environment
+    displayName: Which environment do you want to deploy to?
+    type: string
+    default: 'Development'
+    values:
+    - Development
+    - Staging
+    - Production
+
+variables:
+  azureSubscription: 'DMS ARM SC NRG'
+  DevfunctionAppName: 'dms-order-ms-function'
+  StagingfunctionAppName: 'dms-order-ms-function-staging'
+  ProductionfunctionAppName: 'dms-prd-order-fxn'
+  vmImageName: 'aks-deployment-jumpbox'
+  dev-url: https://$(DevfunctionAppName).azurewebsites.net
+  staging-url: https://$(StagingfunctionAppName).azurewebsites.net
+  production-url: https://$(ProductionfunctionAppName).azurewebsites.net
+  poll-time: 10s
+
+  DevAppConfigurationEndpoint: https://dms-development.azconfig.io
+  StagingAppConfigurationEndpoint: https://dms-app-config-staging.azconfig.io
+  ProductionAppConfigurationEndpoint: https://dms-prd-app-config.azconfig.io
+
+  sonarqubeprojectKey: 'Dangote_Management_System__DMS__OrderMicroserviceFunctions_AYVkHzfA5RfU06GU7yEH'
+  sonarqubehost: https://dms-sonar.azurewebsites.net
+  SonarKey: $(SonarQubeKey)
+
+stages:
+- stage: Build
+  condition: ne(variables['Build.SourceBranch'], 'refs/heads/develop')
+  jobs:
+  - job: Build_APP
+    displayName: Build
+    pool: $(vmImageName)
+
+    steps:
+    - checkout: self
+      clean: "true"
+      fetchDepth: "0"
+      displayName: Checkout
+
+    - script: |
+        git gc --prune=all && git repack -a -f -F -d
+      displayName: Cleanup old history
+
+    - task: UseDotNet@2
+      displayName: 'Install .NET Core SDK'
+      inputs:
+        packageType: 'sdk'
+        version: '6.0.x'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore tools'
+      inputs:
+        command: custom
+        custom: tool
+        arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Prepare Code Analysis'
+      inputs:
+        command: custom
+        custom: dotnet-sonarscanner
+        arguments: begin /k:$(sonarqubeprojectKey) /d:sonar.host.url=$(sonarqubehost) /d:sonar.login=$(SonarKey)
+        workingDirectory: $(Build.SourcesDirectory)
+
+    - task: AzureAppConfiguration@5
+      displayName: Fetch function url
+      inputs:
+        azureSubscription: $(azureSubscription)
+        AppConfigurationEndpoint: $(DevAppConfigurationEndpoint)
+        KeyFilter: 'AppMicroservices:Order:BaseUrl'
+
+
+    - task: replacetokens@3
+      displayName: Set order base url
+      inputs:
+        rootDirectory: '$(System.DefaultWorkingDirectory)'
+        targetFiles: '**\ApiConstant.cs'
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'fail'
+        keepToken: false
+        tokenPrefix: '#['
+        tokenSuffix: ']#'
+        useLegacyPattern: false
+        enableTransforms: false
+        enableTelemetry: false
+
+    - task: DotNetCoreCLI@2
+      displayName: Build APP
+      inputs:
+        command: 'build'
+        projects: $(Build.SourcesDirectory)/**/*.csproj
+        arguments: --output $(System.DefaultWorkingDirectory)/publish_output --configuration Release
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Run code analysis'
+      inputs:
+        command: custom
+        custom: dotnet-sonarscanner
+        arguments: end /d:sonar.login=$(SonarKey)
+        workingDirectory: $(Build.SourcesDirectory)
+
+- stage: Development
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Development'))
+  jobs:
+  - deployment: Development
+    environment: Development
+    displayName: Development
+    pool: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch function url
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(DevAppConfigurationEndpoint)
+              KeyFilter: 'AppMicroservices:Order:BaseUrl'
+
+          - task: replacetokens@3
+            displayName: Set order base url
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\ApiConstant.cs'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: Build APP
+            inputs:
+              command: 'build'
+              projects: $(Build.SourcesDirectory)/**/*.csproj
+              arguments: --output $(System.DefaultWorkingDirectory)/publish_output --configuration Release
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive APP files'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy APP'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: functionApp
+              appName: $(DevfunctionAppName)
+              package: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(dev-url) > /dev/null
+              failOnStderr: true
+
+- stage: Staging
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Staging'))
+  jobs:
+  - deployment: Staging
+    environment: Staging
+    displayName: Staging
+    pool: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch function url
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(StagingAppConfigurationEndpoint)
+              KeyFilter: 'AppMicroservices:Order:BaseUrl'
+
+          - task: replacetokens@3
+            displayName: Set order base url
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\ApiConstant.cs'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: Build APP
+            inputs:
+              command: 'build'
+              projects: $(Build.SourcesDirectory)/**/*.csproj
+              arguments: --output $(System.DefaultWorkingDirectory)/publish_output --configuration Release
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive APP files'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy APP'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: functionApp
+              appName: $(StagingfunctionAppName)
+              package: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(staging-url) > /dev/null
+              failOnStderr: true
+
+- stage: Production
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'), eq('${{parameters.environment}}', 'Production'))
+  jobs:
+  - deployment: Production
+    environment: Production
+    displayName: Production
+    pool: 'dms-prd-deployment-node'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none # skip unnecessary downloads of artifacts
+
+          - checkout: self
+            clean: "true"
+
+          - script: |
+              git gc --prune=all && git repack -a -f -F -d
+            displayName: Cleanup old history
+
+          - task: AzureAppConfiguration@5
+            displayName: Fetch function url
+            inputs:
+              azureSubscription: $(azureSubscription)
+              AppConfigurationEndpoint: $(ProductionAppConfigurationEndpoint)
+              KeyFilter: 'AppMicroservices:Order:BaseUrl'
+
+          - task: replacetokens@3
+            displayName: Set order base url
+            inputs:
+              rootDirectory: '$(System.DefaultWorkingDirectory)'
+              targetFiles: '**\ApiConstant.cs'
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'fail'
+              keepToken: false
+              tokenPrefix: '#['
+              tokenSuffix: ']#'
+              useLegacyPattern: false
+              enableTransforms: false
+              enableTelemetry: false
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET Core SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '6.0.x'
+
+          - task: DotNetCoreCLI@2
+            displayName: 'Restore tools'
+            inputs:
+              command: custom
+              custom: tool
+              arguments: restore --tool-manifest $(Build.SourcesDirectory)/.config/dotnet-tools.json
+
+          - task: DotNetCoreCLI@2
+            displayName: Build APP
+            inputs:
+              command: 'build'
+              projects: $(Build.SourcesDirectory)/**/*.csproj
+              arguments: --output $(System.DefaultWorkingDirectory)/publish_output --configuration Release
+
+          - task: ArchiveFiles@2
+            displayName: 'Archive APP files'
+            inputs:
+              rootFolderOrFile: '$(System.DefaultWorkingDirectory)/publish_output'
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+              replaceExistingArchive: true
+
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy APP'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appType: functionApp
+              appName: $(ProductionfunctionAppName)
+              package: $(Build.ArtifactStagingDirectory)/$(Build.BuildId).zip
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: |
+                sleep $(poll-time)
+                curl -sSf $(production-url) > /dev/null
+              failOnStderr: true
